@@ -1,0 +1,10 @@
+[package]
+name = "zipf-docs"
+version = "0.1.0"
+edition = "2024"
+description = "Generate random documents with Zipf-distributed words and log-normal lengths for benchmarking"
+license = "MIT"
+
+[dependencies]
+rand = "0.9"
+rand_distr = "0.5"
