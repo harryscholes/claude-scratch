@@ -1,0 +1,9 @@
+[package]
+name = "helix-help"
+version = "0.1.0"
+edition = "2024"
+description = "A CLI tool to help learn Helix editor keybindings and commands"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+colored = "2"
