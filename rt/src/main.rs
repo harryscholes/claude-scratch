@@ -1,7 +1,9 @@
+use blake3::Hasher;
 use clap::Parser;
 use colored::Colorize;
 use crossbeam_channel::bounded;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::BufReader;
@@ -9,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::SystemTime;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
@@ -72,6 +75,22 @@ struct Args {
     /// Case-insensitive search
     #[arg(short = 'i', long)]
     ignore_case: bool,
+
+    /// Disable index caching (always rebuild)
+    #[arg(long)]
+    no_cache: bool,
+
+    /// Clear the cache for this directory before searching
+    #[arg(long)]
+    clear_cache: bool,
+
+    /// Custom cache directory (defaults to ~/.cache/rt)
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+
+    /// Show cache statistics
+    #[arg(long)]
+    cache_stats: bool,
 }
 
 /// Represents a search match with context
@@ -93,6 +112,252 @@ struct FileEntry {
     lines: Vec<(usize, usize)>, // (start_offset, end_offset) for each line
 }
 
+/// Metadata for a single file used for cache invalidation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileMetadata {
+    path: String,
+    size: u64,
+    modified: u64, // seconds since UNIX epoch
+}
+
+/// Cache manifest stored alongside the index
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheManifest {
+    version: u32,
+    hash: String,
+    file_count: usize,
+    created: u64,
+    search_path: String,
+    extensions: Vec<String>,
+    hidden: bool,
+    max_depth: usize,
+    follow_links: bool,
+}
+
+const CACHE_VERSION: u32 = 1;
+
+/// Manages the disk cache for Tantivy indexes
+struct CacheManager {
+    cache_dir: PathBuf,
+}
+
+impl CacheManager {
+    fn new(custom_dir: Option<PathBuf>) -> Option<Self> {
+        let cache_dir = custom_dir.or_else(|| {
+            dirs::cache_dir().map(|d| d.join("rt"))
+        })?;
+
+        // Create cache directory if it doesn't exist
+        fs::create_dir_all(&cache_dir).ok()?;
+
+        Some(CacheManager { cache_dir })
+    }
+
+    /// Get the cache directory for a specific hash
+    fn get_index_dir(&self, hash: &str) -> PathBuf {
+        self.cache_dir.join(hash)
+    }
+
+    /// Check if a valid cached index exists
+    fn get_cached_index(&self, hash: &str) -> Option<Index> {
+        let index_dir = self.get_index_dir(hash);
+        let manifest_path = index_dir.join("manifest.json");
+
+        // Check if manifest exists and is valid
+        let manifest_data = fs::read_to_string(&manifest_path).ok()?;
+        let manifest: CacheManifest = serde_json::from_str(&manifest_data).ok()?;
+
+        // Verify version compatibility
+        if manifest.version != CACHE_VERSION {
+            return None;
+        }
+
+        // Verify hash matches
+        if manifest.hash != hash {
+            return None;
+        }
+
+        // Try to open the index
+        Index::open_in_dir(&index_dir).ok()
+    }
+
+    /// Save an index to the cache
+    fn save_index(
+        &self,
+        hash: &str,
+        files: &[FileEntry],
+        args: &Args,
+        search_path: &Path,
+        memory_mb: usize,
+    ) -> Option<Index> {
+        let index_dir = self.get_index_dir(hash);
+
+        // Remove old cache if it exists
+        if index_dir.exists() {
+            fs::remove_dir_all(&index_dir).ok()?;
+        }
+
+        fs::create_dir_all(&index_dir).ok()?;
+
+        // Create and populate the index
+        let index = create_index(&index_dir).ok()?;
+        let file_count = Arc::new(AtomicUsize::new(0));
+        index_files(&index, files, memory_mb, file_count);
+
+        // Write manifest
+        let manifest = CacheManifest {
+            version: CACHE_VERSION,
+            hash: hash.to_string(),
+            file_count: files.len(),
+            created: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            search_path: search_path.to_string_lossy().to_string(),
+            extensions: args.extensions.clone(),
+            hidden: args.hidden,
+            max_depth: args.max_depth,
+            follow_links: args.follow_links,
+        };
+
+        let manifest_json = serde_json::to_string_pretty(&manifest).ok()?;
+        fs::write(index_dir.join("manifest.json"), manifest_json).ok()?;
+
+        Some(index)
+    }
+
+    /// Clear cache for a specific hash
+    fn clear_cache(&self, hash: &str) -> bool {
+        let index_dir = self.get_index_dir(hash);
+        if index_dir.exists() {
+            fs::remove_dir_all(&index_dir).is_ok()
+        } else {
+            true
+        }
+    }
+
+    /// Get cache statistics
+    fn get_stats(&self) -> CacheStats {
+        let mut stats = CacheStats::default();
+
+        if let Ok(entries) = fs::read_dir(&self.cache_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    stats.index_count += 1;
+                    if let Ok(size) = dir_size(&entry.path()) {
+                        stats.total_size += size;
+                    }
+
+                    // Read manifest for details
+                    let manifest_path = entry.path().join("manifest.json");
+                    if let Ok(data) = fs::read_to_string(&manifest_path) {
+                        if let Ok(manifest) = serde_json::from_str::<CacheManifest>(&data) {
+                            stats.total_files += manifest.file_count;
+                        }
+                    }
+                }
+            }
+        }
+
+        stats
+    }
+}
+
+#[derive(Default)]
+struct CacheStats {
+    index_count: usize,
+    total_size: u64,
+    total_files: usize,
+}
+
+/// Calculate directory size recursively
+fn dir_size(path: &Path) -> std::io::Result<u64> {
+    let mut size = 0;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            size += dir_size(&entry.path())?;
+        } else {
+            size += metadata.len();
+        }
+    }
+    Ok(size)
+}
+
+/// Compute a hash of file metadata for cache invalidation
+fn compute_files_hash(args: &Args, search_path: &Path) -> (String, Vec<FileMetadata>) {
+    let mut walker = WalkDir::new(search_path).follow_links(args.follow_links);
+
+    if args.max_depth > 0 {
+        walker = walker.max_depth(args.max_depth);
+    }
+
+    let extensions: HashSet<&str> = args.extensions.iter().map(|s| s.as_str()).collect();
+
+    let mut file_metas: Vec<FileMetadata> = walker
+        .into_iter()
+        .filter_entry(|e| {
+            if !args.hidden && e.file_name().to_string_lossy().starts_with('.') {
+                return false;
+            }
+            true
+        })
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            if extensions.is_empty() {
+                return true;
+            }
+            e.path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| extensions.contains(ext))
+                .unwrap_or(false)
+        })
+        .filter(|e| !is_binary_file(e.path()))
+        .filter_map(|e| {
+            let metadata = e.metadata().ok()?;
+            let modified = metadata
+                .modified()
+                .ok()?
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some(FileMetadata {
+                path: e.path().to_string_lossy().to_string(),
+                size: metadata.len(),
+                modified,
+            })
+        })
+        .collect();
+
+    // Sort for deterministic hashing
+    file_metas.sort_by(|a, b| a.path.cmp(&b.path));
+
+    // Compute hash
+    let mut hasher = Hasher::new();
+
+    // Include search parameters in hash
+    hasher.update(search_path.to_string_lossy().as_bytes());
+    hasher.update(&[args.hidden as u8]);
+    hasher.update(&args.max_depth.to_le_bytes());
+    hasher.update(&[args.follow_links as u8]);
+    for ext in &args.extensions {
+        hasher.update(ext.as_bytes());
+    }
+
+    // Include file metadata
+    for meta in &file_metas {
+        hasher.update(meta.path.as_bytes());
+        hasher.update(&meta.size.to_le_bytes());
+        hasher.update(&meta.modified.to_le_bytes());
+    }
+
+    let hash = hasher.finalize();
+    (hash.to_hex().to_string(), file_metas)
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -110,6 +375,21 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Handle cache stats request
+    if args.cache_stats {
+        if let Some(cache_mgr) = CacheManager::new(args.cache_dir.clone()) {
+            let stats = cache_mgr.get_stats();
+            println!("{}", "Cache Statistics".bold().cyan());
+            println!("  Cache directory: {}", cache_mgr.cache_dir.display());
+            println!("  Cached indexes:  {}", stats.index_count);
+            println!("  Total files:     {}", stats.total_files);
+            println!("  Total size:      {}", format_size(stats.total_size));
+        } else {
+            eprintln!("{}: Could not access cache directory", "error".red().bold());
+        }
+        return;
+    }
+
     if args.hierarchical {
         run_hierarchical_search(&args, &search_path);
     } else {
@@ -117,29 +397,91 @@ fn main() {
     }
 }
 
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 /// Run a flat search that indexes all files first, then searches
 fn run_flat_search(args: &Args, search_path: &Path) {
-    let files = collect_files(args, search_path);
+    let cache_mgr = if args.no_cache {
+        None
+    } else {
+        CacheManager::new(args.cache_dir.clone())
+    };
 
-    if files.is_empty() {
-        eprintln!("{}: No files found to search", "warning".yellow().bold());
-        return;
+    // Compute hash for cache lookup
+    let (hash, _file_metas) = compute_files_hash(args, search_path);
+
+    // Handle clear cache request
+    if args.clear_cache {
+        if let Some(ref mgr) = cache_mgr {
+            if mgr.clear_cache(&hash) {
+                eprintln!("{}: Cache cleared", "info".blue().bold());
+            }
+        }
     }
 
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let index = create_index(temp_dir.path()).expect("Failed to create index");
+    // Try to use cached index
+    let (index, files, used_cache) = if let Some(ref mgr) = cache_mgr {
+        if let Some(cached_index) = mgr.get_cached_index(&hash) {
+            // Load files for display (we still need content for showing matches)
+            let files = collect_files(args, search_path);
+            (cached_index, files, true)
+        } else {
+            // Build new index and cache it
+            let files = collect_files(args, search_path);
+            if files.is_empty() {
+                eprintln!("{}: No files found to search", "warning".yellow().bold());
+                return;
+            }
 
-    let file_count = Arc::new(AtomicUsize::new(0));
-    let total_files = files.len();
+            eprint!("Indexing {} files... ", files.len());
+            let index = mgr
+                .save_index(&hash, &files, args, search_path, args.memory_mb)
+                .expect("Failed to create cached index");
+            eprintln!("{} {}", "done".green(), "(cached)".dimmed());
 
-    eprint!("Indexing {} files... ", total_files);
+            (index, files, false)
+        }
+    } else {
+        // No caching - use temp directory
+        let files = collect_files(args, search_path);
+        if files.is_empty() {
+            eprintln!("{}: No files found to search", "warning".yellow().bold());
+            return;
+        }
 
-    index_files(&index, &files, args.memory_mb, Arc::clone(&file_count));
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let index = create_index(temp_dir.path()).expect("Failed to create index");
 
-    eprintln!("{}", "done".green());
+        let file_count = Arc::new(AtomicUsize::new(0));
+        eprint!("Indexing {} files... ", files.len());
+        index_files(&index, &files, args.memory_mb, Arc::clone(&file_count));
+        eprintln!("{}", "done".green());
+
+        // Keep temp_dir alive by leaking it (it will be cleaned up on process exit)
+        std::mem::forget(temp_dir);
+
+        (index, files, false)
+    };
+
+    if used_cache {
+        eprintln!("{}: Using cached index ({} files)", "cache".blue().bold(), files.len());
+    }
 
     let matches = search_index(&index, &args.query, args.max_results, args.ignore_case);
-
     display_matches(args, &files, &matches);
 }
 
@@ -650,6 +992,10 @@ impl Clone for Args {
             threads: self.threads,
             files_only: self.files_only,
             ignore_case: self.ignore_case,
+            no_cache: self.no_cache,
+            clear_cache: self.clear_cache,
+            cache_dir: self.cache_dir.clone(),
+            cache_stats: self.cache_stats,
         }
     }
 }
