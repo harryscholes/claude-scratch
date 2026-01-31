@@ -1,0 +1,24 @@
+[package]
+name = "ivf-centroids-vortex"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Demonstration of storing IVF centroids inside Vortex files with a custom layout"
+license = "Apache-2.0"
+
+[dependencies]
+# Vortex core crates for array types
+vortex-array = "0.58"
+vortex-buffer = "0.58"
+vortex-dtype = "0.58"
+vortex-error = "0.58"
+
+# Utilities
+rand = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[example]]
+name = "ivf_demo"
+path = "examples/ivf_demo.rs"
