@@ -33,11 +33,11 @@ struct Args {
     path: PathBuf,
 
     /// Number of context lines to show before and after matches
-    #[arg(short = 'C', long, default_value = "2")]
+    #[arg(short = 'C', long, default_value = "0")]
     context: usize,
 
     /// Maximum number of results to return (0 for unlimited)
-    #[arg(short = 'n', long, default_value = "100")]
+    #[arg(short = 'n', long, default_value = "0")]
     max_results: usize,
 
     /// Include hidden files and directories
