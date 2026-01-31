@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Instant, SystemTime};
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{Query, QueryParser};
 use tantivy::schema::*;
-use tantivy::{doc, Index, IndexWriter, ReloadPolicy};
+use tantivy::{doc, Index, IndexWriter, ReloadPolicy, Term};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -1165,61 +1165,62 @@ fn search_index(index: &Index, query_str: &str, max_results: usize, ignore_case:
         .collect()
 }
 
-/// Extract search terms/phrases from a query string
-/// Handles both simple terms and quoted phrases like "fn main"
+/// Extract search terms/phrases from a query string using Tantivy's query parser
+/// This ensures consistency between how the index is queried and how matches are highlighted
 fn extract_search_patterns(query: &str) -> Vec<String> {
-    let mut patterns = Vec::new();
-    let mut chars = query.chars().peekable();
-    let mut current = String::new();
-    let mut in_quotes = false;
+    // Create a minimal schema and index just for query parsing
+    let mut schema_builder = Schema::builder();
+    let content_field = schema_builder.add_text_field("content", TEXT);
+    let schema = schema_builder.build();
 
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                if in_quotes {
-                    // End of quoted phrase
-                    if !current.is_empty() {
-                        patterns.push(current.clone());
-                        current.clear();
-                    }
-                    in_quotes = false;
-                } else {
-                    // Start of quoted phrase - save any pending term first
-                    if !current.is_empty() {
-                        patterns.push(current.clone());
-                        current.clear();
-                    }
-                    in_quotes = true;
-                }
-            }
-            ' ' | '\t' if !in_quotes => {
-                // End of term (not in quotes)
-                if !current.is_empty() {
-                    // Filter out boolean operators
-                    if !["AND", "OR", "NOT"].contains(&current.as_str()) {
-                        patterns.push(current.clone());
-                    }
-                    current.clear();
-                }
-            }
-            '(' | ')' if !in_quotes => {
-                // Skip parentheses
-                if !current.is_empty() {
-                    if !["AND", "OR", "NOT"].contains(&current.as_str()) {
-                        patterns.push(current.clone());
-                    }
-                    current.clear();
-                }
-            }
-            _ => {
-                current.push(c);
+    let index = Index::create_in_ram(schema);
+    let query_parser = QueryParser::for_index(&index, vec![content_field]);
+
+    let parsed_query = match query_parser.parse_query(query) {
+        Ok(q) => q,
+        Err(_) => return Vec::new(),
+    };
+
+    // Extract terms from the parsed query
+    extract_terms_from_query(&*parsed_query, content_field)
+}
+
+/// Extract text value from a Tantivy Term
+fn term_text(term: &Term) -> Option<String> {
+    // term.value() returns ValueBytes, which has as_str() for text fields
+    term.value().as_str().map(|s| s.to_string())
+}
+
+/// Recursively extract search terms and phrases from a Tantivy query
+fn extract_terms_from_query(query: &dyn Query, field: Field) -> Vec<String> {
+    let mut patterns = Vec::new();
+
+    // Collect all terms from the query
+    let mut terms: Vec<Term> = Vec::new();
+    query.query_terms(&mut |term, _| {
+        if term.field() == field {
+            terms.push(term.clone());
+        }
+    });
+
+    // For simple queries, each term becomes a pattern
+    // For phrase queries, we need to detect and reconstruct phrases
+    // We can detect phrase queries by checking the query type name
+    let query_str = format!("{:?}", query);
+
+    if query_str.contains("PhraseQuery") {
+        // This is a phrase query - reconstruct the phrase from terms
+        let phrase: Vec<String> = terms.iter().filter_map(|t| term_text(t)).collect();
+        if !phrase.is_empty() {
+            patterns.push(phrase.join(" "));
+        }
+    } else {
+        // Boolean query or single term - extract terms individually
+        for term in &terms {
+            if let Some(text) = term_text(term) {
+                patterns.push(text);
             }
         }
-    }
-
-    // Don't forget the last term
-    if !current.is_empty() && !["AND", "OR", "NOT"].contains(&current.as_str()) {
-        patterns.push(current);
     }
 
     patterns
@@ -1242,17 +1243,11 @@ fn find_matches_in_file(
         return matches;
     }
 
-    let content_to_search = if ignore_case {
-        file.content.to_lowercase()
-    } else {
-        file.content.clone()
-    };
-
-    let patterns_to_search: Vec<String> = if ignore_case {
-        search_patterns.iter().map(|s| s.to_lowercase()).collect()
-    } else {
-        search_patterns.clone()
-    };
+    // Tantivy's default tokenizer lowercases all tokens, so we always need to
+    // do case-insensitive matching to be consistent with index results
+    let _ = ignore_case; // We always match case-insensitively since Tantivy does
+    let content_to_search = file.content.to_lowercase();
+    let patterns_to_search: Vec<String> = search_patterns.iter().map(|s| s.to_lowercase()).collect();
 
     for (line_idx, (start, end)) in file.lines.iter().enumerate() {
         let line_content = &content_to_search[*start..*end];
@@ -1375,24 +1370,24 @@ fn highlight_matches(line: &str, query: &str, ignore_case: bool) -> String {
 
     let mut result = line.to_string();
 
-    for pattern in patterns {
-        if ignore_case {
-            let lower_result = result.to_lowercase();
-            let lower_pattern = pattern.to_lowercase();
-            let mut new_result = String::new();
-            let mut last_end = 0;
+    // Tantivy's default tokenizer lowercases all tokens, so we always need
+    // to do case-insensitive matching for highlighting
+    let _ = ignore_case;
 
-            for (start, _) in lower_result.match_indices(&lower_pattern) {
-                new_result.push_str(&result[last_end..start]);
-                let matched_text = &result[start..start + pattern.len()];
-                new_result.push_str(&matched_text.red().bold().to_string());
-                last_end = start + pattern.len();
-            }
-            new_result.push_str(&result[last_end..]);
-            result = new_result;
-        } else {
-            result = result.replace(&pattern, &pattern.red().bold().to_string());
+    for pattern in patterns {
+        let lower_result = result.to_lowercase();
+        let lower_pattern = pattern.to_lowercase();
+        let mut new_result = String::new();
+        let mut last_end = 0;
+
+        for (start, _) in lower_result.match_indices(&lower_pattern) {
+            new_result.push_str(&result[last_end..start]);
+            let matched_text = &result[start..start + pattern.len()];
+            new_result.push_str(&matched_text.red().bold().to_string());
+            last_end = start + pattern.len();
         }
+        new_result.push_str(&result[last_end..]);
+        result = new_result;
     }
 
     result
