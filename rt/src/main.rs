@@ -632,8 +632,15 @@ fn run_hierarchical_search(args: &Args, search_path: &Path) {
 
             let matches = search_index(&index, &args.query, 0, args.ignore_case);
 
-            for (doc_id, score) in matches {
-                if let Some(file) = files_at_depth.get(doc_id as usize) {
+            // Build path map for this depth level
+            let file_map: HashMap<&Path, &&FileEntry> = files_at_depth
+                .iter()
+                .map(|f| (f.path.as_path(), f))
+                .collect();
+
+            for (path, score) in matches {
+                let path_buf = PathBuf::from(&path);
+                if let Some(file) = file_map.get(path_buf.as_path()) {
                     let file_matches = find_matches_in_file(file, &args.query, args.context, score, args.ignore_case);
                     for m in file_matches {
                         if tx.send(m).is_err() {
@@ -1110,8 +1117,8 @@ fn build_index_parallel(
     })
 }
 
-/// Search the index and return matching document IDs with scores
-fn search_index(index: &Index, query_str: &str, max_results: usize, ignore_case: bool) -> Vec<(u64, f32)> {
+/// Search the index and return matching file paths with scores
+fn search_index(index: &Index, query_str: &str, max_results: usize, ignore_case: bool) -> Vec<(String, f32)> {
     let reader = index
         .reader_builder()
         .reload_policy(ReloadPolicy::Manual)
@@ -1121,7 +1128,7 @@ fn search_index(index: &Index, query_str: &str, max_results: usize, ignore_case:
     let searcher = reader.searcher();
     let schema = index.schema();
     let content_field = schema.get_field("content").unwrap();
-    let doc_id_field = schema.get_field("doc_id").unwrap();
+    let path_field = schema.get_field("path").unwrap();
 
     let query_parser = QueryParser::for_index(index, vec![content_field]);
 
@@ -1152,10 +1159,70 @@ fn search_index(index: &Index, query_str: &str, max_results: usize, ignore_case:
         .into_iter()
         .filter_map(|(score, doc_address)| {
             let doc: tantivy::TantivyDocument = searcher.doc(doc_address).ok()?;
-            let doc_id = doc.get_first(doc_id_field)?.as_u64()?;
-            Some((doc_id, score))
+            let path = doc.get_first(path_field)?.as_str()?.to_string();
+            Some((path, score))
         })
         .collect()
+}
+
+/// Extract search terms/phrases from a query string
+/// Handles both simple terms and quoted phrases like "fn main"
+fn extract_search_patterns(query: &str) -> Vec<String> {
+    let mut patterns = Vec::new();
+    let mut chars = query.chars().peekable();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                if in_quotes {
+                    // End of quoted phrase
+                    if !current.is_empty() {
+                        patterns.push(current.clone());
+                        current.clear();
+                    }
+                    in_quotes = false;
+                } else {
+                    // Start of quoted phrase - save any pending term first
+                    if !current.is_empty() {
+                        patterns.push(current.clone());
+                        current.clear();
+                    }
+                    in_quotes = true;
+                }
+            }
+            ' ' | '\t' if !in_quotes => {
+                // End of term (not in quotes)
+                if !current.is_empty() {
+                    // Filter out boolean operators
+                    if !["AND", "OR", "NOT"].contains(&current.as_str()) {
+                        patterns.push(current.clone());
+                    }
+                    current.clear();
+                }
+            }
+            '(' | ')' if !in_quotes => {
+                // Skip parentheses
+                if !current.is_empty() {
+                    if !["AND", "OR", "NOT"].contains(&current.as_str()) {
+                        patterns.push(current.clone());
+                    }
+                    current.clear();
+                }
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+
+    // Don't forget the last term
+    if !current.is_empty() && !["AND", "OR", "NOT"].contains(&current.as_str()) {
+        patterns.push(current);
+    }
+
+    patterns
 }
 
 /// Find matches within a specific file
@@ -1168,13 +1235,10 @@ fn find_matches_in_file(
 ) -> Vec<SearchMatch> {
     let mut matches = Vec::new();
 
-    // Extract search terms from query (simple tokenization)
-    let search_terms: Vec<&str> = query
-        .split_whitespace()
-        .filter(|s| !["AND", "OR", "NOT", "(", ")"].contains(s))
-        .collect();
+    // Extract search terms/phrases from query
+    let search_patterns = extract_search_patterns(query);
 
-    if search_terms.is_empty() {
+    if search_patterns.is_empty() {
         return matches;
     }
 
@@ -1184,16 +1248,16 @@ fn find_matches_in_file(
         file.content.clone()
     };
 
-    let terms_to_search: Vec<String> = if ignore_case {
-        search_terms.iter().map(|s| s.to_lowercase()).collect()
+    let patterns_to_search: Vec<String> = if ignore_case {
+        search_patterns.iter().map(|s| s.to_lowercase()).collect()
     } else {
-        search_terms.iter().map(|s| s.to_string()).collect()
+        search_patterns.clone()
     };
 
     for (line_idx, (start, end)) in file.lines.iter().enumerate() {
         let line_content = &content_to_search[*start..*end];
 
-        let has_match = terms_to_search.iter().any(|term| line_content.contains(term));
+        let has_match = patterns_to_search.iter().any(|pattern| line_content.contains(pattern.as_str()));
 
         if has_match {
             let original_line = &file.content[*start..*end];
@@ -1230,16 +1294,23 @@ fn find_matches_in_file(
 }
 
 /// Display all matches
-fn display_matches(args: &Args, files: &[FileEntry], matches: &[(u64, f32)]) {
+fn display_matches(args: &Args, files: &[FileEntry], matches: &[(String, f32)]) {
     if matches.is_empty() {
         eprintln!("{}: No matches found", "info".blue().bold());
         return;
     }
 
+    // Build a map from path to file entry for efficient lookup
+    let file_map: HashMap<&Path, &FileEntry> = files
+        .iter()
+        .map(|f| (f.path.as_path(), f))
+        .collect();
+
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
-    for (doc_id, score) in matches {
-        if let Some(file) = files.get(*doc_id as usize) {
+    for (path, score) in matches {
+        let path_buf = PathBuf::from(path);
+        if let Some(file) = file_map.get(path_buf.as_path()) {
             if args.files_only {
                 if seen_files.insert(file.path.clone()) {
                     println!("{}", file.path.display());
@@ -1300,30 +1371,27 @@ fn display_single_match(args: &Args, m: &SearchMatch, seen_files: &mut HashSet<P
 
 /// Highlight search terms in the line
 fn highlight_matches(line: &str, query: &str, ignore_case: bool) -> String {
-    let terms: Vec<&str> = query
-        .split_whitespace()
-        .filter(|s| !["AND", "OR", "NOT", "(", ")"].contains(s))
-        .collect();
+    let patterns = extract_search_patterns(query);
 
     let mut result = line.to_string();
 
-    for term in terms {
+    for pattern in patterns {
         if ignore_case {
             let lower_result = result.to_lowercase();
-            let lower_term = term.to_lowercase();
+            let lower_pattern = pattern.to_lowercase();
             let mut new_result = String::new();
             let mut last_end = 0;
 
-            for (start, _) in lower_result.match_indices(&lower_term) {
+            for (start, _) in lower_result.match_indices(&lower_pattern) {
                 new_result.push_str(&result[last_end..start]);
-                let matched_text = &result[start..start + term.len()];
+                let matched_text = &result[start..start + pattern.len()];
                 new_result.push_str(&matched_text.red().bold().to_string());
-                last_end = start + term.len();
+                last_end = start + pattern.len();
             }
             new_result.push_str(&result[last_end..]);
             result = new_result;
         } else {
-            result = result.replace(term, &term.red().bold().to_string());
+            result = result.replace(&pattern, &pattern.red().bold().to_string());
         }
     }
 
