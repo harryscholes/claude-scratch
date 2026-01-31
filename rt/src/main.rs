@@ -1,7 +1,7 @@
 use blake3::Hasher;
 use clap::Parser;
 use colored::Colorize;
-use crossbeam_channel::bounded;
+use crossbeam_channel::{bounded, Receiver, Sender};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -10,8 +10,8 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::SystemTime;
+use std::thread::{self, JoinHandle};
+use std::time::{Instant, SystemTime};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
@@ -91,6 +91,14 @@ struct Args {
     /// Show cache statistics
     #[arg(long)]
     cache_stats: bool,
+
+    /// Use parallel index building with N workers (0 = auto, based on CPU cores)
+    #[arg(long, value_name = "N")]
+    parallel_index: Option<usize>,
+
+    /// Show timing statistics
+    #[arg(long)]
+    stats: bool,
 }
 
 /// Represents a search match with context
@@ -415,6 +423,14 @@ fn format_size(bytes: u64) -> String {
 
 /// Run a flat search that indexes all files first, then searches
 fn run_flat_search(args: &Args, search_path: &Path) {
+    let overall_start = Instant::now();
+
+    // Check if parallel indexing is requested
+    if let Some(num_workers) = args.parallel_index {
+        run_parallel_search(args, search_path, num_workers);
+        return;
+    }
+
     let cache_mgr = if args.no_cache {
         None
     } else {
@@ -481,8 +497,82 @@ fn run_flat_search(args: &Args, search_path: &Path) {
         eprintln!("{}: Using cached index ({} files)", "cache".blue().bold(), files.len());
     }
 
+    let search_start = Instant::now();
     let matches = search_index(&index, &args.query, args.max_results, args.ignore_case);
+    let search_time = search_start.elapsed().as_millis();
+
     display_matches(args, &files, &matches);
+
+    if args.stats {
+        eprintln!(
+            "\n{}: total={}ms, search={}ms",
+            "Stats".cyan().bold(),
+            overall_start.elapsed().as_millis(),
+            search_time
+        );
+    }
+}
+
+/// Run search with parallel index building
+fn run_parallel_search(args: &Args, search_path: &Path, num_workers: usize) {
+    let overall_start = Instant::now();
+
+    // Determine number of workers
+    let num_workers = if num_workers == 0 {
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+    } else {
+        num_workers
+    };
+
+    eprintln!(
+        "{}: Using {} indexing workers",
+        "parallel".cyan().bold(),
+        num_workers
+    );
+
+    // Create temp directory for final index
+    let final_temp_dir = TempDir::new().expect("Failed to create temp directory");
+
+    // Build index in parallel
+    let result = build_index_parallel(args, search_path, num_workers, final_temp_dir.path());
+
+    let Some(parallel_result) = result else {
+        eprintln!("{}: Parallel indexing failed", "error".red().bold());
+        return;
+    };
+
+    // We need to reload files for display since parallel indexing doesn't keep FileEntry
+    let files = collect_files(args, search_path);
+
+    if files.is_empty() {
+        eprintln!("{}: No files found to search", "warning".yellow().bold());
+        return;
+    }
+
+    // Search
+    let search_start = Instant::now();
+    let matches = search_index(&parallel_result.index, &args.query, args.max_results, args.ignore_case);
+    let search_time = search_start.elapsed().as_millis();
+
+    display_matches(args, &files, &matches);
+
+    // Keep temp dir alive
+    std::mem::forget(final_temp_dir);
+
+    if args.stats {
+        eprintln!(
+            "\n{}: total={}ms, walk={}ms, read={}ms, index={}ms, merge={}ms, search={}ms",
+            "Stats".cyan().bold(),
+            overall_start.elapsed().as_millis(),
+            parallel_result.walk_time_ms,
+            parallel_result.read_time_ms,
+            parallel_result.index_time_ms,
+            parallel_result.merge_time_ms,
+            search_time
+        );
+    }
 }
 
 /// Run a hierarchical search that indexes and searches directory by directory
@@ -756,6 +846,270 @@ fn index_files_slice(
     writer.commit().expect("Failed to commit index");
 }
 
+/// Result of parallel indexing - contains the final index and timing stats
+struct ParallelIndexResult {
+    index: Index,
+    _temp_dirs: Vec<TempDir>, // Keep temp dirs alive
+    walk_time_ms: u128,
+    read_time_ms: u128,
+    index_time_ms: u128,
+    merge_time_ms: u128,
+}
+
+/// Build index using parallel workers
+///
+/// Architecture:
+/// 1. Walker thread traverses directory, sends paths to readers
+/// 2. Reader threads read file content, send FileEntry to indexers
+/// 3. Indexer threads each build their own index
+/// 4. Final merge combines all indexes into one
+fn build_index_parallel(
+    args: &Args,
+    search_path: &Path,
+    num_workers: usize,
+    final_index_path: &Path,
+) -> Option<ParallelIndexResult> {
+    let start = Instant::now();
+
+    // Channels for the pipeline
+    let (path_tx, path_rx): (Sender<PathBuf>, Receiver<PathBuf>) = bounded(1000);
+    let (file_tx, file_rx): (Sender<(usize, FileEntry)>, Receiver<(usize, FileEntry)>) = bounded(1000);
+
+    let extensions: Arc<HashSet<String>> = Arc::new(
+        args.extensions.iter().map(|s| s.to_string()).collect()
+    );
+    let hidden = args.hidden;
+    let follow_links = args.follow_links;
+    let max_depth = args.max_depth;
+    let search_path_clone = search_path.to_path_buf();
+
+    // Stats tracking
+    let files_walked = Arc::new(AtomicUsize::new(0));
+    let files_read = Arc::new(AtomicUsize::new(0));
+    let files_indexed = Arc::new(AtomicUsize::new(0));
+
+    // 1. Walker thread - traverses directory tree
+    let files_walked_clone = Arc::clone(&files_walked);
+    let walker_handle: JoinHandle<u128> = thread::spawn(move || {
+        let walk_start = Instant::now();
+        let mut walker = WalkDir::new(&search_path_clone).follow_links(follow_links);
+
+        if max_depth > 0 {
+            walker = walker.max_depth(max_depth);
+        }
+
+        for entry in walker.into_iter()
+            .filter_entry(|e| {
+                if !hidden && e.file_name().to_string_lossy().starts_with('.') {
+                    return false;
+                }
+                true
+            })
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| {
+                if extensions.is_empty() {
+                    return true;
+                }
+                e.path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| extensions.contains(ext))
+                    .unwrap_or(false)
+            })
+            .filter(|e| !is_binary_file(e.path()))
+        {
+            files_walked_clone.fetch_add(1, Ordering::Relaxed);
+            if path_tx.send(entry.path().to_path_buf()).is_err() {
+                break;
+            }
+        }
+        walk_start.elapsed().as_millis()
+    });
+
+    // 2. Reader threads - read file content in parallel
+    let num_readers = num_workers.max(2);
+    let mut reader_handles: Vec<JoinHandle<u128>> = Vec::new();
+
+    for worker_id in 0..num_readers {
+        let path_rx = path_rx.clone();
+        let file_tx = file_tx.clone();
+        let files_read_clone = Arc::clone(&files_read);
+
+        let handle: JoinHandle<u128> = thread::spawn(move || {
+            let read_start = Instant::now();
+
+            for path in path_rx {
+                if let Some(content) = read_file_content(&path) {
+                    let lines = compute_line_offsets(&content);
+                    let entry = FileEntry {
+                        path,
+                        content,
+                        lines,
+                    };
+                    files_read_clone.fetch_add(1, Ordering::Relaxed);
+                    if file_tx.send((worker_id, entry)).is_err() {
+                        break;
+                    }
+                }
+            }
+            read_start.elapsed().as_millis()
+        });
+        reader_handles.push(handle);
+    }
+
+    // Drop extra senders so channels close properly
+    drop(path_rx);
+    drop(file_tx);
+
+    // 3. Indexer threads - each builds its own index
+    let mut indexer_handles: Vec<JoinHandle<(TempDir, Index, u128)>> = Vec::new();
+    // Tantivy requires at least 15MB per thread
+    let memory_per_worker = (args.memory_mb / num_workers).max(15);
+
+    for _ in 0..num_workers {
+        let file_rx = file_rx.clone();
+        let files_indexed_clone = Arc::clone(&files_indexed);
+
+        let handle: JoinHandle<(TempDir, Index, u128)> = thread::spawn(move || {
+            let index_start = Instant::now();
+
+            let temp_dir = TempDir::new().expect("Failed to create temp directory");
+            let index = create_index(temp_dir.path()).expect("Failed to create index");
+
+            let mut writer: IndexWriter = index
+                .writer(memory_per_worker * 1024 * 1024)
+                .expect("Failed to create index writer");
+
+            let schema = index.schema();
+            let path_field = schema.get_field("path").unwrap();
+            let content_field = schema.get_field("content").unwrap();
+            let doc_id_field = schema.get_field("doc_id").unwrap();
+
+            let mut doc_id: u64 = 0;
+
+            for (_worker_id, file) in file_rx {
+                let tantivy_doc = doc!(
+                    path_field => file.path.to_string_lossy().to_string(),
+                    content_field => file.content,
+                    doc_id_field => doc_id
+                );
+                writer.add_document(tantivy_doc).ok();
+                files_indexed_clone.fetch_add(1, Ordering::Relaxed);
+                doc_id += 1;
+            }
+
+            writer.commit().expect("Failed to commit index");
+
+            (temp_dir, index, index_start.elapsed().as_millis())
+        });
+        indexer_handles.push(handle);
+    }
+
+    drop(file_rx);
+
+    // Wait for walker
+    let walk_time = walker_handle.join().ok()?;
+
+    // Wait for readers
+    let read_times: Vec<u128> = reader_handles.into_iter()
+        .filter_map(|h| h.join().ok())
+        .collect();
+    let read_time = read_times.into_iter().max().unwrap_or(0);
+
+    // Wait for indexers and collect their indexes
+    let mut worker_indexes: Vec<(TempDir, Index)> = Vec::new();
+    let mut index_times: Vec<u128> = Vec::new();
+
+    for handle in indexer_handles {
+        if let Ok((temp_dir, index, time)) = handle.join() {
+            worker_indexes.push((temp_dir, index));
+            index_times.push(time);
+        }
+    }
+
+    let index_time = index_times.into_iter().max().unwrap_or(0);
+
+    // 4. Merge all worker indexes into final index
+    let merge_start = Instant::now();
+
+    let final_index = create_index(final_index_path).ok()?;
+    let mut final_writer: IndexWriter = final_index
+        .writer(args.memory_mb * 1024 * 1024)
+        .expect("Failed to create final index writer");
+
+    let schema = final_index.schema();
+    let path_field = schema.get_field("path").unwrap();
+    let content_field = schema.get_field("content").unwrap();
+    let doc_id_field = schema.get_field("doc_id").unwrap();
+
+    let mut global_doc_id: u64 = 0;
+
+    for (_temp_dir, worker_index) in &worker_indexes {
+        let reader = worker_index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .ok()?;
+
+        let searcher = reader.searcher();
+        let worker_schema = worker_index.schema();
+        let worker_path_field = worker_schema.get_field("path").unwrap();
+        let worker_content_field = worker_schema.get_field("content").unwrap();
+
+        for segment_reader in searcher.segment_readers() {
+            let store_reader = segment_reader.get_store_reader(1).ok()?;
+
+            for doc_id in 0..segment_reader.num_docs() {
+                if let Ok(doc) = store_reader.get::<tantivy::TantivyDocument>(doc_id) {
+                    let path_value = doc.get_first(worker_path_field)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let content_value = doc.get_first(worker_content_field)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let new_doc = doc!(
+                        path_field => path_value.to_string(),
+                        content_field => content_value.to_string(),
+                        doc_id_field => global_doc_id
+                    );
+                    final_writer.add_document(new_doc).ok();
+                    global_doc_id += 1;
+                }
+            }
+        }
+    }
+
+    final_writer.commit().expect("Failed to commit final index");
+    let merge_time = merge_start.elapsed().as_millis();
+
+    // Keep temp dirs alive by moving them into result
+    let temp_dirs: Vec<TempDir> = worker_indexes.into_iter().map(|(td, _)| td).collect();
+
+    let total_time = start.elapsed().as_millis();
+
+    eprintln!(
+        "{} {} files in {}ms (walk: {}ms, read: {}ms, index: {}ms, merge: {}ms)",
+        "Indexed".green().bold(),
+        files_indexed.load(Ordering::Relaxed),
+        total_time,
+        walk_time,
+        read_time,
+        index_time,
+        merge_time
+    );
+
+    Some(ParallelIndexResult {
+        index: final_index,
+        _temp_dirs: temp_dirs,
+        walk_time_ms: walk_time,
+        read_time_ms: read_time,
+        index_time_ms: index_time,
+        merge_time_ms: merge_time,
+    })
+}
+
 /// Search the index and return matching document IDs with scores
 fn search_index(index: &Index, query_str: &str, max_results: usize, ignore_case: bool) -> Vec<(u64, f32)> {
     let reader = index
@@ -996,6 +1350,8 @@ impl Clone for Args {
             clear_cache: self.clear_cache,
             cache_dir: self.cache_dir.clone(),
             cache_stats: self.cache_stats,
+            parallel_index: self.parallel_index,
+            stats: self.stats,
         }
     }
 }
