@@ -1,12 +1,12 @@
 [package]
-name = "rt"
+name = "ripbm25"
 version = "0.1.0"
 edition = "2024"
-description = "A ripgrep-like CLI tool using Tantivy for full-text search"
+description = "A ripgrep-like CLI tool using Tantivy for full-text search with BM25 ranking"
 license = "MIT"
 
 [[bin]]
-name = "rt"
+name = "rb"
 path = "src/main.rs"
 
 [dependencies]

@@ -19,11 +19,11 @@ use tantivy::{doc, Index, IndexWriter, ReloadPolicy, Term};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
-/// rt - Ripgrep-like search tool powered by Tantivy
+/// rb - Ripgrep-like search tool powered by Tantivy with BM25 ranking
 ///
 /// Recursively indexes files and searches using full-text search capabilities.
 #[derive(Parser, Debug)]
-#[command(name = "rt", version, about, long_about = None)]
+#[command(name = "rb", version, about, long_about = None)]
 struct Args {
     /// The search query (supports Tantivy query syntax)
     query: String,
@@ -84,7 +84,7 @@ struct Args {
     #[arg(long)]
     clear_cache: bool,
 
-    /// Custom cache directory (defaults to ~/.cache/rt)
+    /// Custom cache directory (defaults to ~/.cache/rb)
     #[arg(long, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
 
@@ -152,7 +152,7 @@ struct CacheManager {
 impl CacheManager {
     fn new(custom_dir: Option<PathBuf>) -> Option<Self> {
         let cache_dir = custom_dir.or_else(|| {
-            dirs::cache_dir().map(|d| d.join("rt"))
+            dirs::cache_dir().map(|d| d.join("rb"))
         })?;
 
         // Create cache directory if it doesn't exist
