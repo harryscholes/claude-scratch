@@ -1,0 +1,26 @@
+[package]
+name = "ripbm25"
+version = "0.1.0"
+edition = "2024"
+description = "A ripgrep-like CLI tool using Tantivy for full-text search with BM25 ranking"
+license = "MIT"
+
+[[bin]]
+name = "rb"
+path = "src/main.rs"
+
+[dependencies]
+tantivy = "0.22"
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+colored = "2"
+tempfile = "3"
+rayon = "1"
+crossbeam-channel = "0.5"
+memmap2 = "0.9"
+encoding_rs = "0.8"
+encoding_rs_io = "0.1"
+blake3 = "1"
+dirs = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
