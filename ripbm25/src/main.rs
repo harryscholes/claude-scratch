@@ -1,21 +1,21 @@
 use blake3::Hasher;
 use clap::Parser;
 use colored::Colorize;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Instant, SystemTime};
 use tantivy::collector::TopDocs;
 use tantivy::query::{Query, QueryParser};
 use tantivy::schema::*;
-use tantivy::{doc, Index, IndexWriter, ReloadPolicy, Term};
+use tantivy::{Index, IndexWriter, ReloadPolicy, Term, doc};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -109,6 +109,7 @@ struct SearchMatch {
     line_content: String,
     context_before: Vec<(usize, String)>,
     context_after: Vec<(usize, String)>,
+    #[allow(dead_code)]
     score: f32,
 }
 
@@ -119,6 +120,9 @@ struct FileEntry {
     content: String,
     lines: Vec<(usize, usize)>, // (start_offset, end_offset) for each line
 }
+
+/// Type alias for file channel messages (worker_id, file_entry)
+type FileMessage = (usize, FileEntry);
 
 /// Metadata for a single file used for cache invalidation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,9 +155,7 @@ struct CacheManager {
 
 impl CacheManager {
     fn new(custom_dir: Option<PathBuf>) -> Option<Self> {
-        let cache_dir = custom_dir.or_else(|| {
-            dirs::cache_dir().map(|d| d.join("rb"))
-        })?;
+        let cache_dir = custom_dir.or_else(|| dirs::cache_dir().map(|d| d.join("rb")))?;
 
         // Create cache directory if it doesn't exist
         fs::create_dir_all(&cache_dir).ok()?;
@@ -258,10 +260,10 @@ impl CacheManager {
 
                     // Read manifest for details
                     let manifest_path = entry.path().join("manifest.json");
-                    if let Ok(data) = fs::read_to_string(&manifest_path) {
-                        if let Ok(manifest) = serde_json::from_str::<CacheManifest>(&data) {
-                            stats.total_files += manifest.file_count;
-                        }
+                    if let Ok(data) = fs::read_to_string(&manifest_path)
+                        && let Ok(manifest) = serde_json::from_str::<CacheManifest>(&data)
+                    {
+                        stats.total_files += manifest.file_count;
                     }
                 }
             }
@@ -376,10 +378,17 @@ fn main() {
             .ok();
     }
 
-    let search_path = args.path.canonicalize().unwrap_or_else(|_| args.path.clone());
+    let search_path = args
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| args.path.clone());
 
     if !search_path.exists() {
-        eprintln!("{}: Path does not exist: {}", "error".red().bold(), search_path.display());
+        eprintln!(
+            "{}: Path does not exist: {}",
+            "error".red().bold(),
+            search_path.display()
+        );
         std::process::exit(1);
     }
 
@@ -441,12 +450,11 @@ fn run_flat_search(args: &Args, search_path: &Path) {
     let (hash, _file_metas) = compute_files_hash(args, search_path);
 
     // Handle clear cache request
-    if args.clear_cache {
-        if let Some(ref mgr) = cache_mgr {
-            if mgr.clear_cache(&hash) {
-                eprintln!("{}: Cache cleared", "info".blue().bold());
-            }
-        }
+    if args.clear_cache
+        && let Some(ref mgr) = cache_mgr
+        && mgr.clear_cache(&hash)
+    {
+        eprintln!("{}: Cache cleared", "info".blue().bold());
     }
 
     // Try to use cached index
@@ -494,7 +502,11 @@ fn run_flat_search(args: &Args, search_path: &Path) {
     };
 
     if used_cache {
-        eprintln!("{}: Using cached index ({} files)", "cache".blue().bold(), files.len());
+        eprintln!(
+            "{}: Using cached index ({} files)",
+            "cache".blue().bold(),
+            files.len()
+        );
     }
 
     let search_start = Instant::now();
@@ -553,7 +565,12 @@ fn run_parallel_search(args: &Args, search_path: &Path, num_workers: usize) {
 
     // Search
     let search_start = Instant::now();
-    let matches = search_index(&parallel_result.index, &args.query, args.max_results, args.ignore_case);
+    let matches = search_index(
+        &parallel_result.index,
+        &args.query,
+        args.max_results,
+        args.ignore_case,
+    );
     let search_time = search_start.elapsed().as_millis();
 
     display_matches(args, &files, &matches);
@@ -641,7 +658,13 @@ fn run_hierarchical_search(args: &Args, search_path: &Path) {
             for (path, score) in matches {
                 let path_buf = PathBuf::from(&path);
                 if let Some(file) = file_map.get(path_buf.as_path()) {
-                    let file_matches = find_matches_in_file(file, &args.query, args.context, score, args.ignore_case);
+                    let file_matches = find_matches_in_file(
+                        file,
+                        &args.query,
+                        args.context,
+                        score,
+                        args.ignore_case,
+                    );
                     for m in file_matches {
                         if tx.send(m).is_err() {
                             break;
@@ -709,14 +732,10 @@ fn is_binary_file(path: &Path) -> bool {
     // Check extension first for common binary types
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let binary_extensions = [
-            "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "svg",
-            "mp3", "mp4", "avi", "mov", "mkv", "wav", "flac",
-            "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-            "zip", "tar", "gz", "bz2", "xz", "7z", "rar",
-            "exe", "dll", "so", "dylib", "a", "o", "obj",
-            "class", "pyc", "pyo", "wasm",
-            "ttf", "otf", "woff", "woff2", "eot",
-            "db", "sqlite", "sqlite3",
+            "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "svg", "mp3", "mp4", "avi", "mov",
+            "mkv", "wav", "flac", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "zip", "tar",
+            "gz", "bz2", "xz", "7z", "rar", "exe", "dll", "so", "dylib", "a", "o", "obj", "class",
+            "pyc", "pyo", "wasm", "ttf", "otf", "woff", "woff2", "eot", "db", "sqlite", "sqlite3",
         ];
         if binary_extensions.contains(&ext.to_lowercase().as_str()) {
             return true;
@@ -880,11 +899,10 @@ fn build_index_parallel(
 
     // Channels for the pipeline
     let (path_tx, path_rx): (Sender<PathBuf>, Receiver<PathBuf>) = bounded(1000);
-    let (file_tx, file_rx): (Sender<(usize, FileEntry)>, Receiver<(usize, FileEntry)>) = bounded(1000);
+    let (file_tx, file_rx): (Sender<FileMessage>, Receiver<FileMessage>) = bounded(1000);
 
-    let extensions: Arc<HashSet<String>> = Arc::new(
-        args.extensions.iter().map(|s| s.to_string()).collect()
-    );
+    let extensions: Arc<HashSet<String>> =
+        Arc::new(args.extensions.iter().map(|s| s.to_string()).collect());
     let hidden = args.hidden;
     let follow_links = args.follow_links;
     let max_depth = args.max_depth;
@@ -905,7 +923,8 @@ fn build_index_parallel(
             walker = walker.max_depth(max_depth);
         }
 
-        for entry in walker.into_iter()
+        for entry in walker
+            .into_iter()
             .filter_entry(|e| {
                 if !hidden && e.file_name().to_string_lossy().starts_with('.') {
                     return false;
@@ -993,9 +1012,7 @@ fn build_index_parallel(
             let content_field = schema.get_field("content").unwrap();
             let doc_id_field = schema.get_field("doc_id").unwrap();
 
-            let mut doc_id: u64 = 0;
-
-            for (_worker_id, file) in file_rx {
+            for (doc_id, (_worker_id, file)) in (0_u64..).zip(file_rx) {
                 let tantivy_doc = doc!(
                     path_field => file.path.to_string_lossy().to_string(),
                     content_field => file.content,
@@ -1003,7 +1020,6 @@ fn build_index_parallel(
                 );
                 writer.add_document(tantivy_doc).ok();
                 files_indexed_clone.fetch_add(1, Ordering::Relaxed);
-                doc_id += 1;
             }
 
             writer.commit().expect("Failed to commit index");
@@ -1019,7 +1035,8 @@ fn build_index_parallel(
     let walk_time = walker_handle.join().ok()?;
 
     // Wait for readers
-    let read_times: Vec<u128> = reader_handles.into_iter()
+    let read_times: Vec<u128> = reader_handles
+        .into_iter()
         .filter_map(|h| h.join().ok())
         .collect();
     let read_time = read_times.into_iter().max().unwrap_or(0);
@@ -1069,10 +1086,12 @@ fn build_index_parallel(
 
             for doc_id in 0..segment_reader.num_docs() {
                 if let Ok(doc) = store_reader.get::<tantivy::TantivyDocument>(doc_id) {
-                    let path_value = doc.get_first(worker_path_field)
+                    let path_value = doc
+                        .get_first(worker_path_field)
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let content_value = doc.get_first(worker_content_field)
+                    let content_value = doc
+                        .get_first(worker_content_field)
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
@@ -1118,7 +1137,12 @@ fn build_index_parallel(
 }
 
 /// Search the index and return matching file paths with scores
-fn search_index(index: &Index, query_str: &str, max_results: usize, ignore_case: bool) -> Vec<(String, f32)> {
+fn search_index(
+    index: &Index,
+    query_str: &str,
+    max_results: usize,
+    ignore_case: bool,
+) -> Vec<(String, f32)> {
     let reader = index
         .reader_builder()
         .reload_policy(ReloadPolicy::Manual)
@@ -1155,14 +1179,19 @@ fn search_index(index: &Index, query_str: &str, max_results: usize, ignore_case:
         }
     };
 
-    top_docs
+    let mut results: Vec<(String, f32)> = top_docs
         .into_iter()
         .filter_map(|(score, doc_address)| {
             let doc: tantivy::TantivyDocument = searcher.doc(doc_address).ok()?;
             let path = doc.get_first(path_field)?.as_str()?.to_string();
             Some((path, score))
         })
-        .collect()
+        .collect();
+
+    // Sort by BM25 score in descending order
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    results
 }
 
 /// Extract search terms/phrases from a query string using Tantivy's query parser
@@ -1210,7 +1239,7 @@ fn extract_terms_from_query(query: &dyn Query, field: Field) -> Vec<String> {
 
     if query_str.contains("PhraseQuery") {
         // This is a phrase query - reconstruct the phrase from terms
-        let phrase: Vec<String> = terms.iter().filter_map(|t| term_text(t)).collect();
+        let phrase: Vec<String> = terms.iter().filter_map(term_text).collect();
         if !phrase.is_empty() {
             patterns.push(phrase.join(" "));
         }
@@ -1247,12 +1276,15 @@ fn find_matches_in_file(
     // do case-insensitive matching to be consistent with index results
     let _ = ignore_case; // We always match case-insensitively since Tantivy does
     let content_to_search = file.content.to_lowercase();
-    let patterns_to_search: Vec<String> = search_patterns.iter().map(|s| s.to_lowercase()).collect();
+    let patterns_to_search: Vec<String> =
+        search_patterns.iter().map(|s| s.to_lowercase()).collect();
 
     for (line_idx, (start, end)) in file.lines.iter().enumerate() {
         let line_content = &content_to_search[*start..*end];
 
-        let has_match = patterns_to_search.iter().any(|pattern| line_content.contains(pattern.as_str()));
+        let has_match = patterns_to_search
+            .iter()
+            .any(|pattern| line_content.contains(pattern.as_str()));
 
         if has_match {
             let original_line = &file.content[*start..*end];
@@ -1296,10 +1328,8 @@ fn display_matches(args: &Args, files: &[FileEntry], matches: &[(String, f32)]) 
     }
 
     // Build a map from path to file entry for efficient lookup
-    let file_map: HashMap<&Path, &FileEntry> = files
-        .iter()
-        .map(|f| (f.path.as_path(), f))
-        .collect();
+    let file_map: HashMap<&Path, &FileEntry> =
+        files.iter().map(|f| (f.path.as_path(), f)).collect();
 
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
