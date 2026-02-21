@@ -1,0 +1,7 @@
+[package]
+name = "bwt"
+version = "0.1.0"
+edition = "2021"
+description = "An efficient implementation of the Burrows-Wheeler Transform"
+
+[dependencies]
